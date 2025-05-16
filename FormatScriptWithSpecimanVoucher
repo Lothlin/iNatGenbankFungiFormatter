@@ -1,0 +1,232 @@
+/**
+ * @OnlyCurrentDoc
+ */
+function getObservationFieldsFull() {
+  const BATCH_SIZE = 50;
+  const scriptProperties = PropertiesService.getScriptProperties();
+  const startIndex = parseInt(scriptProperties.getProperty("lastProcessedIndex") || "0", 10);
+
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const sheet1 = ss.getSheets()[0];
+  const sheet2 = ss.getSheets()[1];
+  const sheet3 = ss.getSheets()[2];
+  const sheet4 = ss.getSheets()[3]; // Error and execution log
+  const notes = ss.getSheets()[4].getRange('A21').getValue();
+  const isolate = ss.getSheets()[4].getRange('A18').getValue();
+  const forPrim = ss.getSheets()[4].getRange('A24').getValue();
+  const revPrim = ss.getSheets()[4].getRange('A26').getValue();
+
+  const isFreshRun = !scriptProperties.getProperty("lastProcessedIndex");
+
+  // Clear sheets 2, 3, 4 if fresh manual run
+  if (isFreshRun) {
+    sheet2.clearContents();
+    sheet3.clearContents();
+    sheet4.clearContents();
+    sheet4.appendRow(["Observation ID", "Error Message", "Timestamp"]);
+    Logger.log("Run started (manual). Cleared Sheets 2, 3, and 4.");
+    sheet4.appendRow(["", "Run started (manual). Cleared Sheets 2, 3, and 4.", new Date().toISOString()]);
+  } else {
+    Logger.log("Trigger batch run started.");
+    sheet4.appendRow(["", "Trigger batch run started.", new Date().toISOString()]);
+  }
+
+  const lastRow1 = sheet1.getLastRow();
+  const endIndex = Math.min(startIndex + BATCH_SIZE, lastRow1 - 1);
+
+  const idData = sheet1.getRange("A2:A" + lastRow1).getValues();
+  const fieldName1 = "Accession Number"
+  const fieldName2 = "Provisional Species Name";
+  const fieldName3 = "Collected By";
+  const ricFieldName = "Reads in Consensus (RiC)";
+  const itsFieldName = "DNA Barcode ITS";
+  const lsuFieldName = "DNA Barcode LSU";
+  const monthAbbr = ["JAN", "FEB", "MAR", "APR", "MAY", "JUN", "JUL", "AUG", "SEP", "OCT", "NOV", "DEC"];
+
+  let row2 = sheet2.getLastRow() + 1;
+  let row3 = sheet3.getLastRow() + 1;
+
+  for (let i = startIndex; i < endIndex; i++) {
+    const row = i + 2;
+    const observationId = idData[i][0];
+    if (!observationId) continue;
+
+    let value1 = "missing";
+    let value2 = null;
+    let collectorName = "missing";
+    let latitude = "missing";
+    let longitude = "missing";
+    let countryName = "missing";
+    let collectionDate = "missing";
+    let ricVal = "";
+    let itsVal = "";
+    let lsuVal = "";
+
+    try {
+      const resp = UrlFetchApp.fetch(`https://api.inaturalist.org/v1/observations/${observationId}`);
+      Utilities.sleep(600);
+      const result = JSON.parse(resp.getContentText());
+      const obs = (result.results && result.results[0]) || {};
+
+      if (Array.isArray(obs.ofvs)) {
+        obs.ofvs.forEach(ofv => {
+          if (ofv.name === fieldName1) value1 = ofv.value;
+          if (ofv.name === fieldName2) value2 = ofv.value;
+          if (ofv.name === fieldName3) collectorName = ofv.value;
+          if (ofv.name === ricFieldName) ricVal = ofv.value;
+          if (ofv.name === itsFieldName) itsVal = ofv.value || "";
+          if (ofv.name === lsuFieldName) lsuVal = ofv.value || "";
+        });
+      }
+
+      if (!value2 && obs.taxon) value2 = obs.taxon.name;
+
+      if (value2) {
+        value2 = value2
+          .replace(/“|”/g, '"')
+          .replace(/‘|’/g, "'")
+          .replace(/"/g, "'");
+
+        let updated = false;
+
+        // Case 1: Genus sp-suffix
+        let m = value2.match(/^(\w+)[\s'"]*sp[- ]?(\w+)['"]?$/i);
+        if (m) {
+          value2 = `${m[1]} sp. '${m[2]}'`;
+          updated = true;
+        }
+
+        // Case 2: Genus PNW##
+        if (!updated) {
+          m = value2.match(/^(\w+)[\s']*(PNW\d{2})['"]?$/i);
+          if (m) {
+            value2 = `${m[1]} sp. '${m[2]}'`;
+            updated = true;
+          }
+        }
+
+        // Case 3: Genus Woo##
+        if (!updated) {
+          m = value2.match(/^(\w+)[\s']*(Woo\d{2})['"]?$/i);
+          if (m) {
+            value2 = `${m[1]} sp. '${m[2]}'`;
+            updated = true;
+          }
+        }
+
+        // Case 4: Genus 'epithet' (if not already using sp.)
+        if (!updated) {
+          m = value2.match(/^(\w+)\s*'([^']+)'$/);
+          if (m && !/sp[.-]/i.test(value2)) {
+            value2 = `${m[1]} sp. '${m[2]}'`;
+          }
+        }
+      }
+
+
+      if (collectorName === "missing" && obs.user) {
+        collectorName = obs.user.name || obs.user.login || "missing";
+      }
+
+      if (obs.geojson && Array.isArray(obs.geojson.coordinates)) {
+        const [lon, lat] = obs.geojson.coordinates;
+        if (typeof lat === "number") {
+          latitude = Math.abs(lat).toFixed(2) + (lat >= 0 ? " N" : " S");
+        }
+        if (typeof lon === "number") {
+          longitude = Math.abs(lon).toFixed(2) + (lon >= 0 ? " E" : " W");
+        }
+      }
+
+      if (obs.place_guess) {
+        const parts = obs.place_guess.split(",").map(p => p.trim());
+        let country = parts[parts.length - 1] || "";
+        if (country === "US" || country === "United States") country = "USA";
+        const state = parts.length > 1 ? parts[parts.length - 2] : "";
+        const county = parts.length > 2 ? parts[parts.length - 3] : "";
+        countryName = country ? `${country}: ${state}${county ? ", " + county : ""}` : "missing";
+        placeName = obs.place_guess;
+      }
+
+      if (obs.observed_on && /^\d{4}-\d{2}-\d{2}/.test(obs.observed_on)) {
+        const [y, m, d] = obs.observed_on.split("-");
+        const mon = monthAbbr[parseInt(m, 10) - 1];
+        collectionDate = `'${d}-${mon.charAt(0) + mon.slice(1).toLowerCase()}-${y}`;
+      }
+
+    } catch (e) {
+      const timestamp = new Date().toISOString();
+      const errorMessage = `Error with ID ${observationId}: ${e.message}`;
+      Logger.log(errorMessage);
+      sheet4.appendRow([observationId, e.message, timestamp]);
+      sheet1.getRange(row, 2, 1, 6).setValues([[
+        "Error", `${isolate} #${observationId}`,
+        "Error", "Error", "Error", "Error"
+      ]]);
+      sheet1.getRange(row, 9).setValue(forPrim);
+      sheet1.getRange(row, 10).setValue(revPrim);
+      sheet1.getRange(row, 11).setValue(`${notes}#${observationId}; Error occurred`);
+
+      sheet2.getRange(row2++, 1).setValue(">" + observationId + " ERROR");
+      sheet3.getRange(row3++, 1).setValue(">" + observationId + " ERROR");
+      continue;
+    }
+
+    sheet1.getRange(row, 2, 1, 7).setValues([[
+      value1,
+      value2,
+      `${isolate} #${observationId}`,
+      `${latitude} ${longitude}`,
+      countryName,
+      collectionDate,
+      collectorName
+    ]]);
+    sheet1.getRange(row, 9).setValue(forPrim);
+    sheet1.getRange(row, 10).setValue(revPrim);
+
+    let colJ = `${notes} #${observationId}`;
+    if (ricVal) colJ += "; RiC" + ricVal;
+    sheet1.getRange(row, 11).setValue(colJ);
+
+    const headerVal = ">" + observationId;
+    sheet2.getRange(row2++, 1).setValue(headerVal);
+    sheet3.getRange(row3++, 1).setValue(headerVal);
+
+    for (let j = 0; j < itsVal.length; j += 80) {
+      sheet2.getRange(row2++, 1).setValue(itsVal.substr(j, 80));
+    }
+
+    for (let j = 0; j < lsuVal.length; j += 80) {
+      sheet3.getRange(row3++, 1).setValue(lsuVal.substr(j, 80));
+    }
+
+    const timestamp = new Date().toISOString();
+    if (!itsVal || !lsuVal) {
+      let msg = "";
+      if (!itsVal && !lsuVal) msg = "ITS and LSU data missing";
+      else if (!itsVal) msg = "ITS data missing";
+      else if (!lsuVal) msg = "LSU data missing";
+      sheet4.appendRow([observationId, msg, timestamp]);
+    }
+  }
+
+  if (endIndex < lastRow1 - 1) {
+    scriptProperties.setProperty("lastProcessedIndex", endIndex);
+    Logger.log("Next batch ready. Manual run required.");
+    sheet4.appendRow(["", "Next batch ready. Manual run required.", new Date().toISOString()]);
+  } else {
+    scriptProperties.deleteProperty("lastProcessedIndex");
+    deleteAllTriggers();
+    Logger.log("All batches complete. Trigger removed.");
+    sheet4.appendRow(["", "All batches complete. Trigger removed.", new Date().toISOString()]);
+  }
+}
+
+function deleteAllTriggers() {
+  const triggers = ScriptApp.getProjectTriggers();
+  for (let t of triggers) {
+    if (t.getHandlerFunction() === "getObservationFieldsFull") {
+      ScriptApp.deleteTrigger(t);
+    }
+  }
+}
